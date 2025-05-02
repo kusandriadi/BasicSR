@@ -238,8 +238,8 @@ class ConvNeXtDiscriminator(nn.Module):
             num_in_ch: int = 3,
             num_feat: int = 64,
             stage_depth: list = (1, 1, 2, 1),
-            spectral_norm: bool = True,
-    ):
+            apply_sn: bool = True):
+
         super().__init__()
         dims = [num_feat, num_feat * 2, num_feat * 4, num_feat * 8]
 
@@ -266,7 +266,7 @@ class ConvNeXtDiscriminator(nn.Module):
         # classification head – 1×1 conv → global mean → linear
         head_channels = dims[-1]
         head_conv = nn.Conv2d(head_channels, 1, 1)
-        self.head = spectral_norm(head_conv) if spectral_norm else head_conv
+        self.head = spectral_norm(head_conv) if apply_sn else head_conv
 
     def forward_features(self, x):
         x = self.stem(x)
