@@ -170,3 +170,117 @@ class PatchGANDiscriminator(nn.Module):
 
     def forward(self, x):
         return self.model(x)
+
+
+# ---- helper blocks ------------------------------------------------------
+
+
+class LayerNorm2d(nn.LayerNorm):
+    """LayerNorm that works on NCHW tensors (follows ConvNeXt)."""
+
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__(channels, eps=eps)
+
+    def forward(self, x):
+        # (N,C,H,W) -> (N,H,W,C) -> LN -> back
+        return (
+            super()
+            .forward(x.permute(0, 2, 3, 1))
+            .permute(0, 3, 1, 2)
+        )
+
+
+class ConvNeXtBlock(nn.Module):
+    """Depthwise Conv + LayerNorm + PW-MLP block (kernel size 7)."""
+
+    def __init__(self, dim: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.dwconv = nn.Conv2d(
+            dim, dim, kernel_size=7, padding=3, groups=dim
+        )  # depthwise
+        self.norm = LayerNorm2d(dim)
+        self.pwconv1 = nn.Conv2d(dim, int(dim * mlp_ratio), 1)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Conv2d(int(dim * mlp_ratio), dim, 1)
+
+    def forward(self, x):
+        residual = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        return x + residual
+
+
+def make_stage(dim, depth):
+    """Stack `depth` ConvNeXt blocks."""
+    return nn.Sequential(*[ConvNeXtBlock(dim) for _ in range(depth)])
+
+
+# ---- discriminator ------------------------------------------------------
+
+
+@ARCH_REGISTRY.register()
+class ConvNeXtDiscriminator(nn.Module):
+    """ConvNeXt-style discriminator (lightweight).
+
+    Args:
+        num_in_ch  (int): input channels, e.g. 3.
+        num_feat   (int): base feature width. Standard ConvNeXt-tiny starts
+                          at 96, but we scale it from `num_feat`.
+        stage_depth (list[int]): number of blocks in the 4 stages.
+        spectral_norm (bool): apply SN on the 1×1 head conv.
+    """
+
+    def __init__(
+            self,
+            num_in_ch: int = 3,
+            num_feat: int = 64,
+            stage_depth: list = (1, 1, 2, 1),
+            spectral_norm: bool = True,
+    ):
+        super().__init__()
+        dims = [num_feat, num_feat * 2, num_feat * 4, num_feat * 8]
+
+        # patch-embedding stem (4×4 /4)
+        self.stem = nn.Sequential(
+            nn.Conv2d(num_in_ch, dims[0], 4, 4, 0),
+            LayerNorm2d(dims[0]),
+        )
+
+        # hierarchical stages with downsampling between them
+        stages, downs = [], []
+        for i in range(4):
+            stages.append(make_stage(dims[i], stage_depth[i]))
+            if i < 3:  # no downsample after last stage
+                downs.append(
+                    nn.Sequential(
+                        LayerNorm2d(dims[i]),
+                        nn.Conv2d(dims[i], dims[i + 1], 2, 2),
+                    )
+                )
+        self.stages = nn.ModuleList(stages)
+        self.downs = nn.ModuleList(downs)
+
+        # classification head – 1×1 conv → global mean → linear
+        head_channels = dims[-1]
+        head_conv = nn.Conv2d(head_channels, 1, 1)
+        self.head = spectral_norm(head_conv) if spectral_norm else head_conv
+
+    def forward_features(self, x):
+        x = self.stem(x)
+        for i, stage in enumerate(self.stages):
+            x = stage(x)
+            if i < len(self.downs):
+                x = self.downs[i](x)
+        return x
+
+    def forward(self, x):
+        """
+        Input:  H×W image (e.g. 128×128/256×256)
+        Output: PatchGAN-style score map (N × 1 × h' × w')
+        """
+        feats = self.forward_features(x)
+        logits = self.head(feats)
+        return logits
