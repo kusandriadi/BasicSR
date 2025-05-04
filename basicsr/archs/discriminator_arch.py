@@ -300,16 +300,18 @@ class NextSRGANDiscriminator(nn.Module):
         # helper conv layers
         def conv_k3s1(in_ch, out_ch, bias=True):
             layer = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=bias)
-            # weight init: He
-            nn.init.kaiming_normal_(layer.weight, nonlinearity='gelu')
+            nn.init.kaiming_normal_(layer.weight, nonlinearity='linear')
+            layer.weight.data.mul_(0.8)  # approximate GELU gain
             if bias:
                 nn.init.zeros_(layer.bias)
             return layer
 
         def conv_k4s2(in_ch, out_ch, bias=False):
             layer = nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=bias)
-            nn.init.kaiming_normal_(layer.weight, nonlinearity='gelu')
+            nn.init.kaiming_normal_(layer.weight, nonlinearity='linear')
+            layer.weight.data.mul_(0.8)  # approximate GELU gain
             return layer
+
 
         self.gelu = nn.GELU()
         # stage 0
