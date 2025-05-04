@@ -284,3 +284,87 @@ class ConvNeXtDiscriminator(nn.Module):
         feats = self.forward_features(x)
         logits = self.head(feats)
         return logits
+
+@ARCH_REGISTRY.register()
+class NextSRGANDiscriminator(nn.Module):
+    """
+    ConvNeXt-inspired discriminator from NextSRGAN (Fig.6 of the paper).
+
+    Architecture:
+      - conv3x3 stride1 + conv4x4 stride2 + BN
+      - repeat stages doubling channels: [1,2,4,8]
+      - global average pooling + linear output
+    """
+    def __init__(self, num_in_ch=3, num_feat=64, wd=0.):
+        super().__init__()
+        # helper conv layers
+        def conv_k3s1(in_ch, out_ch, bias=True):
+            layer = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=bias)
+            # weight init: He
+            nn.init.kaiming_normal_(layer.weight, nonlinearity='gelu')
+            if bias:
+                nn.init.zeros_(layer.bias)
+            return layer
+
+        def conv_k4s2(in_ch, out_ch, bias=False):
+            layer = nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=bias)
+            nn.init.kaiming_normal_(layer.weight, nonlinearity='gelu')
+            return layer
+
+        self.gelu = nn.GELU()
+        # stage 0
+        self.conv0_0 = conv_k3s1(num_in_ch, num_feat)
+        self.conv0_1 = conv_k4s2(num_feat, num_feat, bias=False)
+        self.bn0_1 = nn.BatchNorm2d(num_feat, eps=1e-5, momentum=0.9)
+        # stage 1
+        self.conv1_0 = conv_k3s1(num_feat, num_feat * 2, bias=False)
+        self.conv1_1 = conv_k4s2(num_feat * 2, num_feat * 2, bias=False)
+        self.bn1_1 = nn.BatchNorm2d(num_feat * 2, eps=1e-5, momentum=0.9)
+        # stage 2
+        self.conv2_0 = conv_k3s1(num_feat * 2, num_feat * 4, bias=False)
+        self.conv2_1 = conv_k4s2(num_feat * 4, num_feat * 4, bias=False)
+        self.bn2_1 = nn.BatchNorm2d(num_feat * 4, eps=1e-5, momentum=0.9)
+        # stage 3
+        self.conv3_0 = conv_k3s1(num_feat * 4, num_feat * 8, bias=False)
+        self.conv3_1 = conv_k4s2(num_feat * 8, num_feat * 8, bias=False)
+        self.bn3_1 = nn.BatchNorm2d(num_feat * 8, eps=1e-5, momentum=0.9)
+        # stage 4
+        self.conv4_0 = conv_k3s1(num_feat * 8, num_feat * 8, bias=False)
+        self.conv4_1 = conv_k4s2(num_feat * 8, num_feat * 8, bias=False)
+        self.bn4_1 = nn.BatchNorm2d(num_feat * 8, eps=1e-5, momentum=0.9)
+        # final pooling and linear
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.linear = nn.Linear(num_feat * 8, 1)
+        nn.init.zeros_(self.linear.bias)
+        nn.init.kaiming_normal_(self.linear.weight, nonlinearity='linear')
+
+    def forward(self, x):
+        # stage 0
+        x = self.conv0_0(x)
+        x = self.conv0_1(x)
+        x = self.bn0_1(x)
+        # stage 1
+        x = self.conv1_0(x)
+        x = self.gelu(x)
+        x = self.conv1_1(x)
+        x = self.bn1_1(x)
+        # stage 2
+        x = self.conv2_0(x)
+        x = self.gelu(x)
+        x = self.conv2_1(x)
+        x = self.bn2_1(x)
+        # stage 3
+        x = self.conv3_0(x)
+        x = self.gelu(x)
+        x = self.conv3_1(x)
+        x = self.bn3_1(x)
+        # stage 4
+        x = self.conv4_0(x)
+        x = self.gelu(x)
+        x = self.conv4_1(x)
+        x = self.bn4_1(x)
+        # head
+        b, c, h, w = x.size()
+        x = self.gap(x).view(b, c)
+        x = self.linear(x)
+        return x
