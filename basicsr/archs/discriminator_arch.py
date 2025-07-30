@@ -336,7 +336,7 @@ class NextSRGANDiscriminator(nn.Module):
         self.bn4_1 = nn.BatchNorm2d(num_feat * 8, eps=1e-5, momentum=0.9)
         # final pooling and linear
         self.gap = nn.AdaptiveAvgPool2d(1)
-        self.linear = nn.Linear(num_feat * 8, 1)
+        self.linear = spectral_norm(nn.Linear(num_feat * 8, 1))
         nn.init.zeros_(self.linear.bias)
         nn.init.kaiming_normal_(self.linear.weight, nonlinearity='linear')
 
