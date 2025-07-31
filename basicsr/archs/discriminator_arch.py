@@ -1,3 +1,5 @@
+import math
+import torch
 from torch import nn as nn
 from torch.nn import functional as F
 from torch.nn.utils import spectral_norm
@@ -149,6 +151,36 @@ class UNetDiscriminatorSN(nn.Module):
 
         return out
 
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False):
+        super(DepthwiseSeparableConv, self).__init__()
+        self.depthwise = nn.Conv2d(in_ch, in_ch, kernel_size, stride, padding, groups=in_ch, bias=False)
+        self.pointwise = nn.Conv2d(in_ch, out_ch, 1, 1, 0, bias=bias)
+        
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
 @ARCH_REGISTRY.register()
 class PatchGANDiscriminator(nn.Module):
     def __init__(self, num_in_ch=3, num_feat=64):
@@ -170,6 +202,131 @@ class PatchGANDiscriminator(nn.Module):
 
     def forward(self, x):
         return self.model(x)
+
+
+class GhostConv(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1, ratio=2):
+        super(GhostConv, self).__init__()
+        init_ch = out_ch // ratio
+        new_ch = init_ch * (ratio - 1)
+        
+        self.primary_conv = nn.Conv2d(in_ch, init_ch, kernel_size, stride, padding, bias=False)
+        self.cheap_operation = nn.Conv2d(init_ch, new_ch, 3, 1, 1, groups=init_ch, bias=False)
+        
+    def forward(self, x):
+        x1 = self.primary_conv(x)
+        x2 = self.cheap_operation(x1)
+        return torch.cat([x1, x2], dim=1)
+
+
+class EfficientChannelAttention(nn.Module):
+    def __init__(self, channels, gamma=2, b=1):
+        super(EfficientChannelAttention, self).__init__()
+        k = int(abs((math.log(channels, 2) + b) / gamma))
+        k = k if k % 2 else k + 1
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return x * y.expand_as(x)
+
+
+@ARCH_REGISTRY.register()
+class UltraLightDiscriminator(nn.Module):
+    def __init__(self, num_in_ch=3, num_feat=32):
+        super(UltraLightDiscriminator, self).__init__()
+        
+        # Multi-scale input branches for better PI metrics
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(num_in_ch, num_feat//2, 4, 2, 1),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.branch2 = nn.Sequential(
+            nn.AvgPool2d(2),
+            nn.Conv2d(num_in_ch, num_feat//2, 4, 2, 1),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # Ghost convolutions (50% parameter reduction)
+        self.ghost1 = GhostConv(num_feat, num_feat * 2, 4, 2, 1)
+        self.eca1 = EfficientChannelAttention(num_feat * 2)
+        self.act1 = nn.LeakyReLU(0.2, inplace=True)
+        
+        self.ghost2 = GhostConv(num_feat * 2, num_feat * 4, 4, 2, 1)
+        self.eca2 = EfficientChannelAttention(num_feat * 4) 
+        self.act2 = nn.LeakyReLU(0.2, inplace=True)
+        
+        # Lightweight head with global features
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.local_conv = spectral_norm(nn.Conv2d(num_feat * 4, 1, 4, 1, 1))
+        self.global_fc = spectral_norm(nn.Linear(num_feat * 4, 1))
+        
+    def forward(self, x):
+        # Multi-scale input processing
+        b1 = self.branch1(x)
+        b2 = F.interpolate(self.branch2(x), size=b1.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([b1, b2], dim=1)
+        
+        # Ghost convolutions with efficient attention
+        x = self.ghost1(x)
+        x = self.eca1(x) 
+        x = self.act1(x)
+        
+        x = self.ghost2(x)
+        x = self.eca2(x)
+        x = self.act2(x)
+        
+        # Dual output: local patches + global score
+        local_out = self.local_conv(x)
+        global_feat = self.global_pool(x).flatten(1)
+        global_out = self.global_fc(global_feat)
+        
+        # Combine for better discrimination
+        return local_out + global_out.unsqueeze(-1).unsqueeze(-1)
+
+
+@ARCH_REGISTRY.register()
+class LightweightDiscriminator(nn.Module):
+    def __init__(self, num_in_ch=3, num_feat=64):
+        super(LightweightDiscriminator, self).__init__()
+        
+        # Initial standard conv
+        self.conv1 = nn.Conv2d(num_in_ch, num_feat, kernel_size=4, stride=2, padding=1)
+        self.act1 = nn.LeakyReLU(0.2, inplace=True)
+        
+        # Depthwise separable convolutions with channel attention
+        self.dsconv1 = DepthwiseSeparableConv(num_feat, num_feat * 2, 4, 2, 1)
+        self.bn1 = nn.BatchNorm2d(num_feat * 2)
+        self.ca1 = ChannelAttention(num_feat * 2)
+        self.act2 = nn.LeakyReLU(0.2, inplace=True)
+        
+        self.dsconv2 = DepthwiseSeparableConv(num_feat * 2, num_feat * 4, 4, 2, 1)
+        self.bn2 = nn.BatchNorm2d(num_feat * 4)
+        self.ca2 = ChannelAttention(num_feat * 4)
+        self.act3 = nn.LeakyReLU(0.2, inplace=True)
+        
+        # Final conv with spectral normalization
+        self.final_conv = spectral_norm(nn.Conv2d(num_feat * 4, 1, kernel_size=4, stride=1, padding=1))
+        
+    def forward(self, x):
+        x = self.act1(self.conv1(x))
+        
+        x = self.dsconv1(x)
+        x = self.bn1(x)
+        x = self.ca1(x)
+        x = self.act2(x)
+        
+        x = self.dsconv2(x)
+        x = self.bn2(x)
+        x = self.ca2(x)
+        x = self.act3(x)
+        
+        x = self.final_conv(x)
+        return x
 
 
 # ---- helper blocks ------------------------------------------------------
