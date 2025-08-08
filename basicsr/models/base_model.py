@@ -8,6 +8,7 @@ from torch.nn.parallel import DataParallel, DistributedDataParallel
 from basicsr.models import lr_scheduler as lr_scheduler
 from basicsr.utils import get_root_logger
 from basicsr.utils.dist_util import master_only
+from basicsr.utils.model_stats import log_discriminator_stats
 
 
 class BaseModel():
@@ -250,6 +251,10 @@ class BaseModel():
         if retry == 0:
             logger.warning(f'Still cannot save {save_path}. Just ignore it.')
             # raise IOError(f'Cannot save {save_path}.')
+        
+        # Log discriminator stats when saving final model
+        if current_iter == 'latest' or (isinstance(current_iter, int) and current_iter > 0):
+            self._log_discriminator_stats_if_final_save(net_label, current_iter)
 
     def _print_different_keys_loading(self, crt_net, load_net, strict=True):
         """Print keys with different name or different size when loading models.
@@ -348,6 +353,30 @@ class BaseModel():
             if retry == 0:
                 logger.warning(f'Still cannot save {save_path}. Just ignore it.')
                 # raise IOError(f'Cannot save {save_path}.')
+
+    def _log_discriminator_stats_if_final_save(self, net_label, current_iter):
+        """Log discriminator statistics when saving final model"""
+        try:
+            # Only log for discriminator networks and when training is finishing
+            if ('net_d' in net_label.lower() or 'discriminator' in net_label.lower()) and \
+               (current_iter == 'latest' or (isinstance(current_iter, int) and current_iter % 10000 == 0)):
+                
+                # Get discriminator network
+                if hasattr(self, 'net_d') and self.net_d is not None:
+                    discriminator = self.get_bare_model(self.net_d)
+                    discriminator_name = f"{net_label} ({type(discriminator).__name__})"
+                    
+                    # Log the stats with auto-detected input size from config
+                    log_discriminator_stats(
+                        discriminator=discriminator,
+                        discriminator_name=discriminator_name,
+                        input_size=None,  # Will auto-detect from config
+                        opt=getattr(self, 'opt', None)  # Pass training config
+                    )
+                    
+        except Exception as e:
+            logger = get_root_logger()
+            logger.warning(f'Failed to log discriminator stats: {e}')
 
     def resume_training(self, resume_state):
         """Reload the optimizers and schedulers for resumed training.

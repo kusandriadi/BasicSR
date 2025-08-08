@@ -442,6 +442,219 @@ class ConvNeXtDiscriminator(nn.Module):
         logits = self.head(feats)
         return logits
 
+class DetailEnhancedConv(nn.Module):
+    """Enhanced convolution block for detail preservation (PSNR optimization)"""
+    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1, use_spectral_norm=False):
+        super(DetailEnhancedConv, self).__init__()
+        conv = nn.Conv2d(in_ch, out_ch, kernel_size, stride, padding, bias=False)
+        self.conv = spectral_norm(conv) if use_spectral_norm else conv
+        self.bn = nn.BatchNorm2d(out_ch, eps=1e-5, momentum=0.9)
+        self.gelu = nn.GELU()
+        
+        # Enhanced weight initialization for better detail detection
+        nn.init.kaiming_normal_(self.conv.weight, nonlinearity='linear')
+        self.conv.weight.data.mul_(0.8)  # NextSRGAN-style scaling
+        
+    def forward(self, x):
+        return self.gelu(self.bn(self.conv(x)))
+
+
+class MultiScaleFeatureExtractor(nn.Module):
+    """Multi-scale feature extraction for both structure and detail"""
+    def __init__(self, in_ch, out_ch):
+        super(MultiScaleFeatureExtractor, self).__init__()
+        # Structure path (original UltraLight approach)
+        self.structure_branch = nn.Sequential(
+            GhostConv(in_ch, out_ch//2, 4, 2, 1),
+            EfficientChannelAttention(out_ch//2)
+        )
+        
+        # Detail path (NextSRGAN-inspired for PSNR)
+        self.detail_branch = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch//4, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(out_ch//4, out_ch//2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(out_ch//2, eps=1e-5, momentum=0.9),
+            nn.GELU()
+        )
+        
+        # Fusion layer
+        self.fusion = nn.Conv2d(out_ch, out_ch, 1, 1, 0)
+        
+    def forward(self, x):
+        structure_feat = self.structure_branch(x)
+        detail_feat = self.detail_branch(x)
+        combined = torch.cat([structure_feat, detail_feat], dim=1)
+        return self.fusion(combined)
+
+
+@ARCH_REGISTRY.register()
+class UltraLightDiscriminator_v2(nn.Module):
+    """
+    Enhanced UltraLight discriminator with hybrid approach for better PSNR
+    while maintaining SSIM and PI advantages.
+    
+    Key improvements:
+    - Dual-path architecture (structure + detail)
+    - NextSRGAN-inspired detail processing
+    - Enhanced weight initialization
+    - Multi-scale discrimination
+    """
+    def __init__(self, num_in_ch=3, num_feat=32):
+        super(UltraLightDiscriminator_v2, self).__init__()
+        
+        # Enhanced multi-scale input processing
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(num_in_ch, num_feat//2, 4, 2, 1),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.branch2 = nn.Sequential(
+            nn.AvgPool2d(2),
+            nn.Conv2d(num_in_ch, num_feat//2, 4, 2, 1),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # Multi-scale feature extractors with hybrid approach
+        self.msfe1 = MultiScaleFeatureExtractor(num_feat, num_feat * 2)
+        self.msfe2 = MultiScaleFeatureExtractor(num_feat * 2, num_feat * 4)
+        
+        # Enhanced detail processing layer (NextSRGAN-inspired)
+        self.detail_enhancer = DetailEnhancedConv(num_feat * 4, num_feat * 4, 3, 1, 1, use_spectral_norm=True)
+        
+        # Lightweight head with both global and local discrimination
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.local_conv = spectral_norm(nn.Conv2d(num_feat * 4, 1, 4, 1, 1))
+        self.global_fc = spectral_norm(nn.Linear(num_feat * 4, 1))
+        
+        # Enhanced initialization
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Enhanced weight initialization for better detail detection"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                if not hasattr(m, 'weight_initialized'):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=0.2)
+                    m.weight.data.mul_(0.8)  # NextSRGAN scaling
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                    m.weight_initialized = True
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='linear')
+                nn.init.zeros_(m.bias)
+        
+    def forward(self, x):
+        # Enhanced multi-scale input processing
+        b1 = self.branch1(x)
+        b2 = F.interpolate(self.branch2(x), size=b1.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([b1, b2], dim=1)
+        
+        # Multi-scale feature extraction with hybrid approach
+        x = self.msfe1(x)
+        x = self.msfe2(x)
+        
+        # Enhanced detail processing
+        x = self.detail_enhancer(x)
+        
+        # Dual output: local patches + global score (weighted for PSNR)
+        local_out = self.local_conv(x)
+        global_feat = self.global_pool(x).flatten(1)
+        global_out = self.global_fc(global_feat)
+        
+        # Enhanced combination with PSNR-oriented weighting
+        alpha = 0.7  # Higher weight on local details for PSNR
+        beta = 0.3   # Lower weight on global for structure preservation
+        return alpha * local_out + beta * global_out.unsqueeze(-1).unsqueeze(-1)
+
+
+@ARCH_REGISTRY.register()
+class UltraFastQualityDiscriminator(nn.Module):
+    """
+    Ultra-fast discriminator yang mengalahkan PatchGAN di speed DAN quality
+    
+    Design principles:
+    1. PatchGAN speed (minimal layers, sequential)
+    2. UltraLight quality tricks (efficient attention, ghost conv)
+    3. NextSRGAN detail enhancement (GELU, smart init)
+    
+    Target: >2000 FPS + better quality than PatchGAN
+    """
+    def __init__(self, num_in_ch=3, num_feat=48):  # Smaller base features for speed
+        super(UltraFastQualityDiscriminator, self).__init__()
+        
+        # Speed-optimized backbone (PatchGAN-inspired)
+        # Only 3 main conv layers, but with quality enhancements
+        self.conv1 = nn.Conv2d(num_in_ch, num_feat, 4, 2, 1)  # 128→64
+        self.act1 = nn.GELU()  # Better than LeakyReLU for quality
+        
+        # Efficient feature doubling with minimal overhead
+        self.conv2 = nn.Conv2d(num_feat, num_feat * 2, 4, 2, 1, bias=False)  # 64→32
+        self.bn2 = nn.BatchNorm2d(num_feat * 2, eps=1e-5, momentum=0.9)  # NextSRGAN style
+        self.act2 = nn.GELU()
+        
+        # Final feature extraction with quality boost
+        self.conv3 = nn.Conv2d(num_feat * 2, num_feat * 4, 4, 2, 1, bias=False)  # 32→16
+        self.bn3 = nn.BatchNorm2d(num_feat * 4, eps=1e-5, momentum=0.9)
+        self.act3 = nn.GELU()
+        
+        # Ultra-light quality enhancement (minimal cost)
+        # Efficient Channel Attention - 1D conv version (faster than FC)
+        k_size = 3  # Small kernel untuk speed
+        self.eca = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        
+        # Dual-head output for better discrimination
+        # Local: PatchGAN style
+        self.local_head = nn.Conv2d(num_feat * 4, 1, 4, 1, 1)
+        
+        # Global: Single conv + GAP (faster than FC)
+        self.global_conv = nn.Conv2d(num_feat * 4, 1, 1, 1, 0)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        
+        # Enhanced initialization for better quality
+        self._init_weights()
+        
+    def _init_weights(self):
+        """NextSRGAN-style initialization for better detail detection"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='linear')
+                m.weight.data.mul_(0.8)  # NextSRGAN scaling
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward(self, x):
+        # Ultra-fast backbone (3 conv layers only)
+        x = self.act1(self.conv1(x))        # 128→64
+        x = self.act2(self.bn2(self.conv2(x)))  # 64→32  
+        x = self.act3(self.bn3(self.conv3(x)))  # 32→16
+        
+        # Ultra-light quality enhancement (minimal overhead)
+        # Efficient channel attention
+        b, c, h, w = x.size()
+        y = x.view(b, c, -1).mean(dim=2)  # Global avg pool (faster than AdaptiveAvgPool2d)
+        y = self.eca(y.unsqueeze(-1).transpose(-1, -2)).transpose(-1, -2).squeeze(-1)
+        y = self.sigmoid(y).view(b, c, 1, 1)
+        x_enhanced = x * y.expand_as(x)
+        
+        # Dual-head output (quality boost with minimal cost)
+        local_out = self.local_head(x_enhanced)
+        global_out = self.gap(self.global_conv(x_enhanced))
+        
+        # Optimized combination (no broadcasting)
+        return local_out + global_out
+    
+    def get_speed_analysis(self):
+        """Return theoretical speed analysis"""
+        return {
+            "conv_layers": 3,  # vs 8+ in others
+            "skip_connections": 0,  # vs 3 in UNet
+            "attention_ops": 1,  # minimal ECA
+            "branching": "minimal",  # single backbone
+            "expected_fps": ">2000"  # Target beat PatchGAN
+        }
+
+
 @ARCH_REGISTRY.register()
 class NextSRGANDiscriminator(nn.Module):
     """
